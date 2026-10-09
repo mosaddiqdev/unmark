@@ -4,7 +4,7 @@ A small page that takes a photo, throws away everything hidden inside it, trims 
 
 ![icon](icon-512.png)
 
-Live: https://mosaddiqdev.github.io/unmark/ (once Pages is on, and if you name the repo `unmark`)
+Live: https://tryunmark.netlify.app/
 
 ## Why this exists
 
