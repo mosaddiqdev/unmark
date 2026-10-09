@@ -30,12 +30,16 @@ I went looking for the current Indian passport photo size and the sources don't 
 Browsers can't say "make this JPEG exactly 200 KB", so the page searches for it:
 
 1. Encode at a few qualities and binary-search for the highest one that still fits.
-2. Never go below 75% quality. If it still doesn't fit, make the image slightly smaller and search again.
+2. Never go below 60% quality. If it still doesn't fit, make the image slightly smaller and search again.
 3. Once something fits, nudge the size back up to find the largest dimensions that still fit.
 
 PNG ignores the quality setting entirely, so for PNG the only lever is the pixel size. If you don't set a target, JPEG and WebP are saved at up to 95% quality but never larger than the file you started with.
 
 None of this is lossless. A file can't get smaller without losing something. The goal is to lose as little as possible and tell you what happened (the result row shows the quality used and any resize).
+
+## How resizing works
+
+Every resize (the 1–2 px trim, the passport crop, and the shrinking needed to hit a file size) goes through a Lanczos-3 resampler written in the page, not the browser's `drawImage` scaling. It reads the original pixels once and resamples from those for every candidate size, weights all source pixels under each output pixel (no aliasing on big reductions), handles a fractional crop box without extra blur, and works in premultiplied alpha.
 
 ## Things that don't work, or work badly
 

@@ -221,7 +221,7 @@ footer{border-top:1px solid var(--border);padding:24px 0 40px;color:var(--muted-
         <div class="lbl">Target file size<small>Optional</small></div>
         <div class="field"><input type="number" id="kb" min="1" step="1" inputmode="numeric" placeholder="No limit" aria-label="Target size in KB"><span>KB</span></div>
         <div class="chips" id="pre"><button class="badge mono">50</button><button class="badge mono">100</button><button class="badge mono">200</button><button class="badge mono">250</button><button class="badge mono">500</button></div>
-        <p class="hint">Quality stays at 75% or above. If that can't fit, pixels shrink as little as possible.</p>
+        <p class="hint">Quality stays at 60% or above. If that can't fit, pixels shrink as little as possible, using a Lanczos resampler.</p>
 
         <div class="sep"></div>
         <div class="lbl">File name<small>Default: Photograph</small></div>
@@ -348,6 +348,51 @@ addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'&&!$('#
 
 let tt;function toast(m){$('#toastT').textContent=m;$('#toast').classList.add('on');clearTimeout(tt);tt=setTimeout(()=>$('#toast').classList.remove('on'),3200)}
 
+// Lanczos-3 resampler (separable, area-aware). Browsers' drawImage() only does bilinear/mipmap scaling, which aliases
+// on big reductions and softens everything on small ones. This weights every source pixel under each output pixel,
+// honours a fractional crop box (no extra blur from sub-pixel trimming), works in premultiplied alpha, and
+// flattens onto white for JPEG. Edge pixels are clamped, so nothing is invented outside the image.
+function lanczosAxis(nOut,origin,scale,nSrc){
+  const fs=Math.max(1,scale),sup=3*fs,stride=Math.ceil(2*sup)+2;
+  const start=new Int32Array(nOut),w=new Float32Array(nOut*stride);
+  const L=t=>{t=Math.abs(t);return t>=3?0:t<1e-8?1:3*Math.sin(Math.PI*t)*Math.sin(Math.PI*t/3)/(Math.PI*Math.PI*t*t)};
+  for(let i=0;i<nOut;i++){
+    const c=origin+(i+.5)*scale,lo=Math.ceil(c-sup-.5);start[i]=lo;let sum=0;
+    for(let t=0;t<stride;t++){const v=L((lo+t+.5-c)/fs);w[i*stride+t]=v;sum+=v}
+    for(let t=0;t<stride;t++)w[i*stride+t]/=sum;
+  }
+  return{start,w,stride,max:nSrc-1};
+}
+function resample(s,W,H,sx,sy,sw,sh,dw,dh,flatten){
+  const X=lanczosAxis(dw,sx,sw/dw,W),Y=lanczosAxis(dh,sy,sh/dh,H);
+  const cl=(v,m)=>v<0?0:v>m?m:v;
+  const r0=cl(Y.start[0],H-1),r1=cl(Y.start[dh-1]+Y.stride-1,H-1),rows=r1-r0+1;
+  const tmp=new Float32Array(dw*rows*4);
+  for(let y=r0;y<=r1;y++)for(let xo=0;xo<dw;xo++){
+    let r=0,g=0,b=0,a=0;const b0=X.start[xo],o=xo*X.stride;
+    for(let t=0;t<X.stride;t++){
+      const p=(y*W+cl(b0+t,X.max))*4,aw=s[p+3]*X.w[o+t],f=aw/255;
+      r+=s[p]*f;g+=s[p+1]*f;b+=s[p+2]*f;a+=aw;
+    }
+    const q=((y-r0)*dw+xo)*4;tmp[q]=r;tmp[q+1]=g;tmp[q+2]=b;tmp[q+3]=a;
+  }
+  const out=new Uint8ClampedArray(dw*dh*4);
+  for(let yo=0;yo<dh;yo++){
+    const b0=Y.start[yo],o=yo*Y.stride;
+    for(let xo=0;xo<dw;xo++){
+      let r=0,g=0,b=0,a=0;
+      for(let t=0;t<Y.stride;t++){
+        const q=((cl(b0+t,Y.max)-r0)*dw+xo)*4,w=Y.w[o+t];
+        r+=tmp[q]*w;g+=tmp[q+1]*w;b+=tmp[q+2]*w;a+=tmp[q+3]*w;
+      }
+      const p=(yo*dw+xo)*4;
+      if(flatten){const k=255-a;out[p]=r+k;out[p+1]=g+k;out[p+2]=b+k;out[p+3]=255}
+      else if(a>0.5){const k=255/a;out[p]=r*k;out[p+1]=g*k;out[p+2]=b*k;out[p+3]=a}
+    }
+  }
+  return out;
+}
+
 async function clean(file){
   let bmp;
   try{bmp=await createImageBitmap(file,{imageOrientation:'from-image'})}
@@ -366,20 +411,22 @@ async function clean(file){
   let ext=(file.name.split('.').pop()||'').toLowerCase();
   if(mime!==file.type||!ext||ext.length>5)ext=mime.split('/')[1].replace('jpeg','jpg');
   const cap=Math.min(1,Math.sqrt(16e6/(oW*oH)));
+  // Read the source pixels once; every candidate size is resampled from these, never from an already-shrunk copy.
+  const sc=document.createElement('canvas');sc.width=W;sc.height=H;
+  const sctx=sc.getContext('2d',{willReadFrequently:true});sctx.drawImage(bmp,0,0);
+  const src=sctx.getImageData(0,0,W,H).data;sc.width=sc.height=0;
   const c=document.createElement('canvas');
   const x=c.getContext('2d');
   const draw=k=>{
     const w=Math.max(1,Math.round(oW*Math.min(k,cap))),h=Math.max(1,Math.round(w/r));
     c.width=w;c.height=h;
-    if(mime==='image/jpeg'){x.fillStyle='#fff';x.fillRect(0,0,w,h)}
-    x.imageSmoothingQuality='high';
-    x.drawImage(bmp,sx,sy,w2,h2,0,0,w,h);
+    x.putImageData(new ImageData(resample(src,W,H,sx,sy,w2,h2,w,h,mime==='image/jpeg'),w,h),0,0);
     return[w,h];
   };
   const enc=async q=>{const b=await new Promise(res=>c.toBlob(res,mime,q));if(!b||b.type!==mime)throw new Error('enc');return b};
   const lossy=mime!=='image/png';
   const tk=parseFloat($('#kb').value), target=tk>0?tk*1024:0;
-  const QMIN=.75;                       // never trade quality below this; shrink pixels instead
+  const QMIN=.6;                        // quality floor; below this, shrink pixels instead (Lanczos keeps small images sharp)
   let k=1,q=.95,dims=draw(k),blob=await enc(q);
   if(!target&&lossy&&blob.size>file.size){          // no target: never inflate the file
     let lo=.6,hi=.95,best=await enc(lo),bq=lo;
